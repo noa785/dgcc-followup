@@ -1,33 +1,33 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
 import io
 import datetime as dt
 from dateutil import tz
 from pathlib import Path
 import shutil
 
+# your existing DB helpers
 from db_core import init_db, get_conn, get_db_path
 
 # ---------------- Page ----------------
-st.set_page_config(page_title="Follow-up Manager (DB Mode)", page_icon=None, layout="wide")
+st.set_page_config(page_title="Follow-up Manager", layout="wide")
 st.title("Follow-up Manager")
 
-# ---------- Helpers ----------
-CANON_STATUS = {
-    "done": "Done", "completed": "Done", "finished": "Done",
-    "under progress": "Under Progress", "in progress": "Under Progress", "progress": "Under Progress",
-    "not done": "Not Done", "todo": "Not Done", "pending": "Not Done",
-    "rescheduled": "Rescheduled", "deferred": "Rescheduled",
-    "blocked": "Blocked", "on hold": "Blocked",
+# ---------- Canonical status mapping (simple) ----------
+SIMPLE_TO_CANON = {
+    "Not started": "Not Done",
+    "In progress": "Under Progress",
+    "Blocked": "Blocked",
+    "Rescheduled": "Rescheduled",
+    "Done": "Done",
 }
-STATUS_ORDER = ["Overdue", "Due Soon", "Under Progress", "Not Done", "Rescheduled", "Blocked", "Done"]
 
-def canon_status(s):
-    if s is None or str(s).strip() == "":
-        return None
-    return CANON_STATUS.get(str(s).strip().lower(), s)
+STATUS_CHOICES = list(SIMPLE_TO_CANON.keys())
 
+def canon_status(label: str) -> str:
+    return SIMPLE_TO_CANON.get(label, "Not Done")
+
+# ---------- Utilities ----------
 def to_date(x):
     if x in [None, "", "None"]:
         return None
@@ -39,167 +39,11 @@ def to_date(x):
     except Exception:
         return None
 
-def compute_status_row(row, today, due_soon_days):
-    current = canon_status(row.get("Status"))
-    due = to_date(row.get("DueDate"))
-    start = to_date(row.get("StartDate"))
-    resched = to_date(row.get("RescheduledTo"))
-    if (current or "").strip().lower() == "done":
-        return "Done"
-    if resched and resched >= today and (current or "").lower() != "done":
-        return "Rescheduled"
-    if due:
-        if due < today and (current or "").lower() != "done":
-            return "Overdue"
-        days_left = (due - today).days
-        if 0 <= days_left <= st.session_state.get("due_soon_days", 3) and (current or "").lower() != "done":
-            return "Due Soon"
-    if current and current not in ["Rescheduled"]:
-        return current
-    if start and start <= today:
-        return "Under Progress"
-    return "Not Done"
-
-def load_df():
-    conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM tasks ORDER BY DueDate", conn)
-    conn.close()
-    return df
-
-def upsert_task(row_dict, task_id=None):
-    conn = get_conn()
-    cur = conn.cursor()
-    cols = [c for c in row_dict.keys()]
-    vals = [row_dict[c] for c in cols]
-    if task_id is None:
-        q = f"INSERT INTO tasks ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})"
-        cur.execute(q, vals)
-    else:
-        set_clause = ",".join([f"{c}=?" for c in cols])
-        q = f"UPDATE tasks SET {set_clause} WHERE id=?"
-        cur.execute(q, vals + [task_id])
-    conn.commit()
-    conn.close()
-
-def delete_task(task_id):
-    conn = get_conn()
-    conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
-    conn.commit()
-    conn.close()
-
-def get_sla_map():
-    conn = get_conn()
-    sla = pd.read_sql_query("SELECT Category, Priority, TargetDays FROM sla_policies", conn)
-    conn.close()
-    m = {}
-    for _, r in sla.iterrows():
-        key = (str(r["Category"]).strip(), str(r["Priority"]).strip())
-        m[key] = r["TargetDays"]
-    return m
-
-def get_approved_map():
-    conn = get_conn()
-    cl = pd.read_sql_query("SELECT Change_ID, Approved_By, Status FROM change_log", conn)
-    conn.close()
-    m = {}
-    for _, r in cl.iterrows():
-        if str(r.get("Status")).strip().lower() == "approved":
-            m[str(r["Change_ID"])] = r.get("Approved_By")
-    return m
-
-def process_df(df, today, due_soon_days=3):
-    df = df.copy()
-
-    # approvals
-    appr = get_approved_map()
-    if "Change_Request_ID" in df.columns and len(appr):
-        df["Approval_Status"] = df["Approval_Status"].where(df["Change_Request_ID"].isna(), df["Approval_Status"])
-        for i, r in df.iterrows():
-            cr = r.get("Change_Request_ID")
-            if cr and str(cr) in appr:
-                df.at[i, "Approval_Status"] = "Approved"
-                if not r.get("Approval_By"):
-                    df.at[i, "Approval_By"] = appr[str(cr)]
-                res = to_date(r.get("RescheduledTo"))
-                due = to_date(r.get("DueDate"))
-                if res and (not due or res > due):
-                    df.at[i, "DueDate"] = res.isoformat()
-
-    # SLA fill & calc
-    sla_map = get_sla_map()
-    if len(sla_map):
-        def fill_sla(row):
-            if pd.isna(row.get("SLA_TargetDays")) or row.get("SLA_TargetDays") in [None, "", 0]:
-                cat = str(row.get("Category") or "").strip()
-                pri = str(row.get("Priority") or "").strip()
-                return sla_map.get((cat, pri), row.get("SLA_TargetDays"))
-            return row.get("SLA_TargetDays")
-        df["SLA_TargetDays"] = df.apply(fill_sla, axis=1)
-
-    def sla_due(row):
-        created = to_date(row.get("CreatedOn"))
-        days = row.get("SLA_TargetDays")
-        try:
-            d = int(days) if days not in [None, ""] else None
-        except Exception:
-            d = None
-        return (created + dt.timedelta(days=d)).isoformat() if created and d is not None else None
-
-    df["SLA_DueDate"] = df.apply(sla_due, axis=1)
-
-    def sla_breach(row):
-        due = to_date(row.get("SLA_DueDate"))
-        if not due:
-            return False
-        comp = to_date(row.get("CompletedOn"))
-        status = canon_status(row.get("Status"))
-        if comp:
-            return comp > due
-        return today > due and status != "Done"
-
-    df["SLA_Breach"] = df.apply(sla_breach, axis=1)
-    df["Status_Final"] = df.apply(lambda r: compute_status_row(r, today, due_soon_days), axis=1)
-
-    df["Is_Overdue"] = df["Status_Final"].eq("Overdue")
-    df["Is_DueSoon"] = df["Status_Final"].eq("Due Soon")
-    df["Is_Done"] = df["Status_Final"].eq("Done")
-    return df
-
-def export_excel(df_processed):
-    piv_status = df_processed.pivot_table(index="Status_Final", values="Task", aggfunc="count", fill_value=0)\
-                             .rename(columns={"Task":"Count"}).reset_index()
-    piv_unit = df_processed.pivot_table(index="Unit", columns="Status_Final", values="Task", aggfunc="count", fill_value=0)\
-                           .reset_index()
-    piv_week = df_processed.pivot_table(index="Week", columns="Status_Final", values="Task", aggfunc="count", fill_value=0)\
-                           .reset_index()
-    piv_pri = df_processed.pivot_table(index="Priority", columns="Status_Final", values="Task", aggfunc="count", fill_value=0)\
-                          .reset_index()
-    piv_sla = df_processed.assign(SLA_State=df_processed["SLA_Breach"].map({True:"Breach", False:"OK"}))\
-                          .pivot_table(index="SLA_State", values="Task", aggfunc="count", fill_value=0)\
-                          .rename(columns={"Task":"Count"}).reset_index()
-    piv_owner = df_processed.pivot_table(index="Owner", columns="Status_Final", values="Task", aggfunc="count", fill_value=0)\
-                            .reset_index()
-
-    kpi = pd.DataFrame([
-        ["Total Tasks", len(df_processed)],
-        ["Done %", round(float(df_processed["Is_Done"].mean()*100) if len(df_processed) else 0.0, 1)],
-        ["Overdue", int(df_processed["Is_Overdue"].sum())],
-        ["Due Soon", int(df_processed["Is_DueSoon"].sum())],
-        ["SLA Breach", int(df_processed["SLA_Breach"].sum())],
-    ], columns=["Metric", "Value"])
-
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
-        df_processed.to_excel(xl, index=False, sheet_name="1_Tasks_Clean")
-        kpi.to_excel(xl, index=False, sheet_name="2_Weekly_Summary")
-        piv_status.to_excel(xl, index=False, sheet_name="3_Status_Pivot")
-        piv_unit.to_excel(xl, index=False, sheet_name="4_Unit_Pivot")
-        piv_week.to_excel(xl, index=False, sheet_name="5_Week_Pivot")
-        piv_pri.to_excel(xl, index=False, sheet_name="6_Priority_Pivot")
-        piv_sla.to_excel(xl, index=False, sheet_name="7_SLA_Pivot")
-        piv_owner.to_excel(xl, index=False, sheet_name="8_Owner_Pivot")
-    buf.seek(0)
-    return buf.read()
+def compute_week(d):
+    try:
+        return int(pd.to_datetime(d).isocalendar().week)
+    except Exception:
+        return None
 
 # -------- Auto-backup --------
 def _ensure_backup_dir() -> Path:
@@ -214,406 +58,181 @@ def auto_backup_now():
         dst = _ensure_backup_dir() / f"followup_{ts}.db"
         shutil.copy2(db_path, dst)
 
-    tzinfo = tz.gettz(st.session_state.get("tz", "Asia/Riyadh"))
-    today = dt.datetime.now(tzinfo).date()
-    df = load_df()
-    if not df.empty:
-        processed = process_df(df, today, due_soon_days=st.session_state.get("due_soon_days", 3))
-        excel_bytes = export_excel(processed)
-        (Path(".") / "FollowUp_AutoBackup.xlsx").write_bytes(excel_bytes)
+# ---------- DB I/O ----------
+def load_tasks() -> pd.DataFrame:
+    conn = get_conn()
+    try:
+        return pd.read_sql_query("SELECT * FROM tasks", conn)
+    finally:
+        conn.close()
+
+def insert_task(row: dict):
+    cols = list(row.keys())
+    vals = [row[c] for c in cols]
+    q = f"INSERT INTO tasks ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})"
+    conn = get_conn()
+    try:
+        conn.execute(q, vals)
+        conn.commit()
+    finally:
+        conn.close()
 
 # ---------- Sidebar ----------
 with st.sidebar:
     st.header("⚙️ Options")
-    st.session_state["due_soon_days"] = st.number_input("Due soon window (days)", min_value=1, max_value=14, value=3, step=1)
     tz_name = st.text_input("Timezone", value=st.session_state.get("tz", "Asia/Riyadh"))
     st.session_state["tz"] = tz_name
-    st.caption("Backups auto-save to ./backups and an Excel snapshot is saved as FollowUp_AutoBackup.xlsx")
+    st.caption("Saves to SQLite and auto-backs up after every change.")
 
 # ---------- First run ----------
 init_db()
 
-# ==================  TABS (X-LINE)  ==================
-tabs = st.tabs([
-    "Tasks", "Change Log", "SLA Policies", "Owners", "Dashboard & Export", "Import Excel"
-])
+# =========================================================
+#           SIMPLE: Add Deliverable + up to 5 Tasks
+# =========================================================
+st.subheader("Add Deliverable & Tasks")
 
-# -------------------- TASKS TAB --------------------
-with tabs[0]:
-    st.subheader("Tasks")
+with st.form("deliverable_form", clear_on_submit=True):
+    c1, c2, c3 = st.columns([1.1, 1.2, 0.7])
+    Unit = c1.text_input("Unit*", placeholder="e.g., ODU")
+    Deliverable = c2.text_input("Deliverable / Project*", placeholder="e.g., Monthly Dashboard")
+    Deliv_Due = c3.date_input("Deliverable Due (optional)", value=None, format="YYYY-MM-DD")
 
-    # Load once for choices/filters
-    df_all = load_df()
+    c4, c5 = st.columns([1, 1])
+    Deliv_Owner = c4.text_input("Deliverable Owner (optional)")
+    Deliv_Notes = c5.text_input("Notes (optional)")
 
-    # ---- Quick add the same task to many units ----
-    with st.expander("⚡ Quick add: same task for many units", expanded=False):
-        unit_choices = sorted([u for u in df_all["Unit"].dropna().unique().tolist() if str(u).strip()]) if not df_all.empty else []
-        bulk_units = st.multiselect("Units*", unit_choices, help="Select the units to create a task for each one")
+    st.markdown("**Tasks (add 1–5; leave blank rows empty):**")
+    task_rows = []
+    for i in range(1, 6):
+        r1, r2, r3, r4 = st.columns([2.2, 1.2, 1.2, 1.1])
+        t_title = r1.text_input(f"Task {i} title", placeholder="e.g., Collect inputs")
+        t_status = r2.selectbox(f"Status {i}", STATUS_CHOICES, index=0, key=f"st_{i}")
+        t_owner  = r3.text_input(f"Owner {i}", placeholder="(optional)")
+        t_due    = r4.date_input(f"Due {i}", value=None, format="YYYY-MM-DD", key=f"due_{i}")
+        task_rows.append((t_title, t_status, t_owner, t_due))
 
-        c1, c2, c3, c4 = st.columns(4)
-        bulk_task = c1.text_input("Task*", placeholder="Required")
-        bulk_due = c2.date_input("DueDate*", value=dt.date.today(), format="YYYY-MM-DD")
-        bulk_status = c3.selectbox("Status", ["", "Not Done", "Under Progress", "Rescheduled", "Blocked", "Done"])
-        bulk_priority = c4.selectbox("Priority", ["", "Critical", "High", "Medium", "Low"])
+    submitted = st.form_submit_button("➕ Save deliverable & tasks")
 
-        c5, c6 = st.columns(2)
-        bulk_category = c5.selectbox(
-            "Category",
-            ["", "Data Cleaning", "File Merge/ETL", "Scheduling", "Reporting", "Dashboard",
-             "Access/Permissions", "Integration", "Automation", "Bug Fix", "Change Request",
-             "Governance", "Documentation", "Training/Workshop"]
-        )
-        bulk_week = c6.number_input("Week", min_value=1, max_value=55, value=dt.date.today().isocalendar().week)
+    if submitted:
+        if not Unit or not Deliverable:
+            st.error("Please fill **Unit** and **Deliverable / Project**.")
+        else:
+            added = 0
+            for (t_title, t_status, t_owner, t_due) in task_rows:
+                if not t_title.strip():
+                    continue  # skip blank row
 
-        bulk_notes = st.text_area("Notes (optional)")
-        if st.button("➕ Add for all selected units"):
-            if not bulk_units or not bulk_task:
-                st.error("Please select at least one Unit and enter Task.")
-            else:
-                for u in bulk_units:
-                    row = dict(
-                        Unit=u, Role=None, Task=bulk_task, Week=int(bulk_week),
-                        Status=bulk_status or None,
-                        StartDate=None, DueDate=str(bulk_due), RescheduledTo=None,
-                        Owner=None, Notes=bulk_notes or None, Priority=bulk_priority or None,
-                        Category=bulk_category or None, Subcategory=None,
-                        Complexity=None, EffortHours=None, Dependency=None, Blocker=None, RiskLevel=None,
-                        SLA_TargetDays=None, CreatedOn=str(dt.date.today()), CompletedOn=None,
-                        QA_Status=None, QA_Reviewer=None, Approval_Status=None, Approval_By=None,
-                        KPI_Impact=None, KPI_Name=None, Budget_SAR=None, ActualCost_SAR=None,
-                        Benefit_Score=None, Benefit_Notes=None, UAT_Date=None, Release_ID=None,
-                        Change_Request_ID=None, Tags=None
-                    )
-                    upsert_task(row)
-                auto_backup_now()
-                st.success(f"✅ Added '{bulk_task}' for {len(bulk_units)} unit(s).")
-                st.experimental_rerun()
+                due_str = str(t_due) if t_due else (str(Deliv_Due) if Deliv_Due else None)
+                week = compute_week(due_str) if due_str else None
 
-    # ---- Add / Edit Task (single) ----
-    st.subheader("Add / Edit Task")
-
-    def _reset_for_next():
-        for k in ["Unit","Role","Task","Owner","Subcategory","Notes","Change_Request_ID"]:
-            st.session_state[k] = ""
-
-    with st.form("task_form", clear_on_submit=False):
-        c1, c2, c3, c4 = st.columns(4)
-        Unit = c1.text_input("Unit", key="Unit")
-        Role = c2.text_input("Role", key="Role")
-        Task = c3.text_input("Task*", placeholder="Required", key="Task")
-        Week = c4.number_input("Week", min_value=1, max_value=55, value=38, key="Week")
-
-        c5, c6, c7, c8 = st.columns(4)
-        Status = c5.selectbox("Status", ["", "Not Done", "Under Progress", "Rescheduled", "Blocked", "Done"], key="Status")
-        StartDate = c6.date_input("StartDate", value=None, format="YYYY-MM-DD", key="StartDate")
-        DueDate = c7.date_input("DueDate*", value=dt.date.today(), format="YYYY-MM-DD", key="DueDate")
-        RescheduledTo = c8.date_input("RescheduledTo", value=None, format="YYYY-MM-DD", key="RescheduledTo")
-
-        c9, c10, c11, c12 = st.columns(4)
-        Owner = c9.text_input("Owner", key="Owner")
-        Priority = c10.selectbox("Priority", ["", "Critical", "High", "Medium", "Low"], key="Priority")
-        Category = c11.selectbox(
-            "Category",
-            ["", "Data Cleaning", "File Merge/ETL", "Scheduling", "Reporting", "Dashboard",
-             "Access/Permissions", "Integration", "Automation", "Bug Fix", "Change Request",
-             "Governance", "Documentation", "Training/Workshop"],
-            key="Category"
-        )
-        Subcategory = c12.text_input("Subcategory", key="Subcategory")
-
-        c13, c14, c15, c16 = st.columns(4)
-        CreatedOn = c13.date_input("CreatedOn", value=dt.date.today(), format="YYYY-MM-DD", key="CreatedOn")
-        CompletedOn = c14.date_input("CompletedOn", value=None, format="YYYY-MM-DD", key="CompletedOn")
-        SLA_TargetDays = c15.number_input("SLA Target Days", min_value=0, max_value=365, value=0, key="SLA_TargetDays")
-        Change_Request_ID = c16.text_input("Change Request ID", key="Change_Request_ID")
-
-        Notes = st.text_area("Notes", key="Notes")
-
-        b1, b2 = st.columns(2)
-        save = b1.form_submit_button("💾 Save")
-        save_new = b2.form_submit_button("💾 Save & New")
-
-        if save or save_new:
-            if not Task or not DueDate:
-                st.error("Task and DueDate are required.")
-            else:
                 row = dict(
-                    Unit=Unit or None, Role=Role or None, Task=Task, Week=int(Week),
-                    Status=Status or None,
-                    StartDate=str(StartDate) if StartDate else None,
-                    DueDate=str(DueDate),
-                    RescheduledTo=str(RescheduledTo) if RescheduledTo else None,
-                    Owner=Owner or None, Notes=Notes or None, Priority=Priority or None,
-                    Category=Category or None, Subcategory=Subcategory or None,
+                    Unit=Unit.strip(),
+                    Role=None,
+                    Task=t_title.strip(),
+                    Week=week,
+                    Status=canon_status(t_status),
+                    StartDate=None,
+                    DueDate=due_str,
+                    RescheduledTo=None,
+                    Owner=(t_owner or Deliv_Owner or None),
+                    Notes=Deliv_Notes or None,
+                    Priority=None,
+                    Category=None,
+                    Subcategory=Deliverable.strip(),  # GROUP BY deliverable
                     Complexity=None, EffortHours=None, Dependency=None, Blocker=None, RiskLevel=None,
-                    SLA_TargetDays=int(SLA_TargetDays) if SLA_TargetDays else None,
-                    CreatedOn=str(CreatedOn) if CreatedOn else None,
-                    CompletedOn=str(CompletedOn) if CompletedOn else None,
+                    SLA_TargetDays=None,
+                    CreatedOn=str(dt.date.today()),
+                    CompletedOn=None,
                     QA_Status=None, QA_Reviewer=None, Approval_Status=None, Approval_By=None,
                     KPI_Impact=None, KPI_Name=None, Budget_SAR=None, ActualCost_SAR=None,
                     Benefit_Score=None, Benefit_Notes=None, UAT_Date=None, Release_ID=None,
-                    Change_Request_ID=Change_Request_ID or None, Tags=None
+                    Change_Request_ID=None, Tags=None,
                 )
-                upsert_task(row)
+                insert_task(row)
+                added += 1
+
+            if added:
                 auto_backup_now()
-                st.success("✅ Task saved.")
-                if save_new:
-                    _reset_for_next()
-                    st.experimental_rerun()
-
-    st.divider()
-    st.subheader("All Tasks")
-
-    df = load_df()
-    if df.empty:
-        st.info("No tasks yet. Add your first task above.")
-    else:
-        # ---- Filter bar (Units + Week/Month/Custom) ----
-        with st.expander("🔎 Filter tasks by unit and period", expanded=True):
-            unit_options = sorted([u for u in df["Unit"].dropna().unique().tolist() if str(u).strip()])
-            sel_units = st.multiselect("Units", unit_options, help="Leave empty to include all units")
-
-            period = st.selectbox("Period", ["All", "This week", "This month", "Custom range"], index=1)
-            date_from, date_to = None, None
-            today = dt.date.today()
-            if period == "This week":
-                date_from = today - dt.timedelta(days=today.weekday())
-                date_to = date_from + dt.timedelta(days=6)
-            elif period == "This month":
-                date_from = today.replace(day=1)
-                next_month = (date_from.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
-                date_to = next_month - dt.timedelta(days=1)
-            elif period == "Custom range":
-                cA, cB = st.columns(2)
-                date_from = cA.date_input("From (DueDate)", value=today.replace(day=1))
-                date_to = cB.date_input("To (DueDate)", value=today)
-
-            view = df.copy()
-            if sel_units:
-                view = view[view["Unit"].isin(sel_units)]
-            if date_from and date_to:
-                view = view[
-                    (pd.to_datetime(view["DueDate"], errors="coerce").dt.date >= date_from) &
-                    (pd.to_datetime(view["DueDate"], errors="coerce").dt.date <= date_to)
-                ]
-            if "Week" in view.columns:
-                view = view.sort_values(["Week", "Unit", "DueDate"], kind="stable")
-            st.write(f"Showing {len(view)} task(s).")
-            st.dataframe(view, use_container_width=True, hide_index=True)
-
-        # ---- Add multiple rows manually (optional) ----
-        with st.expander("📝 Add multiple rows (manual)", expanded=False):
-            template = pd.DataFrame([{
-                "Unit":"", "Task":"", "DueDate": dt.date.today(),
-                "Week": dt.date.today().isocalendar().week, "Status":"Not Done",
-                "Priority":"", "Category":""
-            }])
-            new_rows = st.data_editor(template, num_rows="dynamic", use_container_width=True)
-            if st.button("💾 Save all rows"):
-                count = 0
-                for _, r in new_rows.iterrows():
-                    if str(r.get("Task") or "").strip() == "":
-                        continue
-                    row = dict(
-                        Unit=str(r.get("Unit") or None), Role=None, Task=str(r.get("Task")),
-                        Week=int(r.get("Week") or dt.date.today().isocalendar().week),
-                        Status=str(r.get("Status") or None),
-                        StartDate=None, DueDate=str(r.get("DueDate") or dt.date.today()), RescheduledTo=None,
-                        Owner=None, Notes=None, Priority=str(r.get("Priority") or None),
-                        Category=str(r.get("Category") or None), Subcategory=None,
-                        Complexity=None, EffortHours=None, Dependency=None, Blocker=None, RiskLevel=None,
-                        SLA_TargetDays=None, CreatedOn=str(dt.date.today()), CompletedOn=None,
-                        QA_Status=None, QA_Reviewer=None, Approval_Status=None, Approval_By=None,
-                        KPI_Impact=None, KPI_Name=None, Budget_SAR=None, ActualCost_SAR=None,
-                        Benefit_Score=None, Benefit_Notes=None, UAT_Date=None, Release_ID=None,
-                        Change_Request_ID=None, Tags=None
-                    )
-                    upsert_task(row)
-                    count += 1
-                if count:
-                    auto_backup_now()
-                    st.success(f"✅ Saved {count} row(s).")
-                    st.experimental_rerun()
-
-        # ---- Simple edit/delete controls ----
-        st.markdown("### Edit / Delete")
-        edited_id = st.number_input("Edit Task ID", min_value=0, value=0, step=1,
-                                    help="Enter the 'id' to edit; see table above.")
-        if edited_id:
-            row = df.loc[df["id"] == edited_id]
-            if not row.empty:
-                r = row.iloc[0].to_dict()
-                st.write("Editing:", r["Task"])
-                with st.form("edit_form"):
-                    new_status = st.selectbox(
-                        "Status",
-                        ["Not Done", "Under Progress", "Rescheduled", "Blocked", "Done"],
-                        index=["Not Done", "Under Progress", "Rescheduled", "Blocked", "Done"].index(r.get("Status") or "Not Done")
-                    )
-                    new_due = st.date_input("DueDate", value=to_date(r.get("DueDate")) or dt.date.today(), format="YYYY-MM-DD")
-                    new_owner = st.text_input("Owner", value=r.get("Owner") or "")
-                    new_notes = st.text_area("Notes", value=r.get("Notes") or "")
-                    save = st.form_submit_button("💾 Save changes")
-                    if save:
-                        upsert_task({"Status": new_status, "DueDate": str(new_due), "Owner": new_owner, "Notes": new_notes},
-                                    task_id=edited_id)
-                        auto_backup_now()
-                        st.success("✅ Saved & backup updated.")
+                st.success(f"✅ Saved **{added} task(s)** under deliverable **{Deliverable}**.")
             else:
-                st.warning("ID not found.")
+                st.info("No tasks entered. Nothing saved.")
 
-        del_id = st.number_input("Delete Task ID", min_value=0, value=0, step=1)
-        if del_id:
-            if st.button("🗑️ Confirm delete"):
-                delete_task(del_id)
-                auto_backup_now()
-                st.success("✅ Deleted & backup updated.")
+st.divider()
 
-# -------------------- CHANGE LOG TAB --------------------
-with tabs[1]:
-    st.subheader("Change Requests")
-    with st.form("cr_form", clear_on_submit=True):
-        c1, c2, c3, c4 = st.columns(4)
-        Change_ID = c1.text_input("Change ID*", placeholder="e.g., CR-101")
-        Date = c2.date_input("Date", value=dt.date.today(), format="YYYY-MM-DD")
-        Requested_By = c3.text_input("Requested By")
-        Status = c4.selectbox("Status", ["Submitted", "In Review", "Approved", "Rejected"])
-        Description = st.text_area("Description")
-        Impact = st.text_input("Impact")
-        Approved_By = st.text_input("Approved By")
-        Linked_Task = st.number_input("Linked Task ID", min_value=0, value=0, help="Optional")
-        submit = st.form_submit_button("➕ Add/Update")
-        if submit:
-            if not Change_ID:
-                st.error("Change ID is required.")
-            else:
-                conn = get_conn()
-                conn.execute(
-                    """INSERT INTO change_log(Change_ID,Date,Requested_By,Description,Impact,Approved_By,Status,Linked_Task)
-                       VALUES(?,?,?,?,?,?,?,?)
-                       ON CONFLICT(Change_ID) DO UPDATE SET
-                       Date=excluded.Date, Requested_By=excluded.Requested_By, Description=excluded.Description,
-                       Impact=excluded.Impact, Approved_By=excluded.Approved_By, Status=excluded.Status, Linked_Task=excluded.Linked_Task
-                    """,
-                    (Change_ID, str(Date), Requested_By, Description, Impact, Approved_By, Status,
-                     int(Linked_Task) if Linked_Task else None)
+# =========================================================
+#           Deliverables Overview (grouped & compact)
+# =========================================================
+st.subheader("Deliverables Overview")
+
+df = load_tasks()
+if df.empty:
+    st.info("No data yet. Add your first deliverable above.")
+else:
+    # normalize useful cols
+    df["DueDate"] = pd.to_datetime(df["DueDate"], errors="coerce")
+    df["Subcategory"] = df["Subcategory"].fillna("")  # Deliverable
+    df["Unit"] = df["Unit"].fillna("")
+    today = pd.Timestamp(dt.datetime.now(tz.gettz(st.session_state["tz"]))).normalize()
+
+    # quick flags
+    done = df["Status"].eq("Done")
+    overdue = (~done) & df["DueDate"].notna() & (df["DueDate"] < today)
+    due_soon = (~done) & df["DueDate"].notna() & (df["DueDate"] >= today) & ((df["DueDate"] - today).dt.days <= 3)
+
+    grp = (df.assign(IsDone=done, IsOverdue=overdue, IsSoon=due_soon)
+             .groupby(["Unit", "Subcategory"], dropna=False)
+             .agg(Total=("Task","count"),
+                  Done=("IsDone","sum"),
+                  Overdue=("IsOverdue","sum"),
+                  DueSoon=("IsSoon","sum"),
+                  DueMin=("DueDate","min"),
+                  DueMax=("DueDate","max"))
+             .reset_index())
+
+    # display compact grid (horizontally)
+    for unit, df_u in grp.groupby("Unit"):
+        st.markdown(f"### Unit: {unit or '—'}")
+        cols = st.columns(3)
+        k = 0
+        for _, row in df_u.sort_values(["DueMin","Subcategory"]).iterrows():
+            with cols[k % 3]:
+                st.markdown(
+                    f"""<div style="padding:14px;border:1px solid #e5e7eb;border-radius:12px;background:#fff;">
+                        <div style="font-weight:600;font-size:18px;margin-bottom:6px;">{row['Subcategory'] or 'Unnamed deliverable'}</div>
+                        <div style="color:#6b7280;margin-bottom:6px;">
+                          Total: {int(row['Total'])} • Done: {int(row['Done'])} •
+                          Due soon: {int(row['DueSoon'])} • Overdue: {int(row['Overdue'])}
+                        </div>
+                        <div style="color:#6b7280;">Due range: {'' if pd.isna(row['DueMin']) else str(row['DueMin'].date())}
+                        {" — " if not pd.isna(row['DueMax']) and not pd.isna(row['DueMin']) else ""}
+                        {'' if pd.isna(row['DueMax']) else str(row['DueMax'].date())}</div>
+                    </div>""",
+                    unsafe_allow_html=True
                 )
-                conn.commit()
-                conn.close()
-                auto_backup_now()
-                st.success("✅ Saved & backup updated.")
+            k += 1
 
-    conn = get_conn()
-    st.dataframe(pd.read_sql_query("SELECT * FROM change_log", conn), use_container_width=True, hide_index=True)
-    conn.close()
+st.divider()
 
-# -------------------- SLA TAB --------------------
-with tabs[2]:
-    st.subheader("SLA Policies")
-    with st.form("sla_form", clear_on_submit=True):
-        c1, c2, c3, c4 = st.columns(4)
-        Category = c1.text_input("Category*", placeholder="e.g., Reporting")
-        Priority = c2.selectbox("Priority*", ["Critical", "High", "Medium", "Low"])
-        TargetDays = c3.number_input("TargetDays*", min_value=1, max_value=365, value=5)
-        Notes = c4.text_input("Notes")
-        submit = st.form_submit_button("➕ Add Policy")
-        if submit:
-            if not Category or not Priority:
-                st.error("Category and Priority are required.")
-            else:
-                conn = get_conn()
-                conn.execute("INSERT INTO sla_policies(Category,Priority,TargetDays,Notes) VALUES(?,?,?,?)",
-                             (Category, Priority, int(TargetDays), Notes))
-                conn.commit()
-                conn.close()
-                auto_backup_now()
-                st.success("✅ Policy added & backup updated.")
+# =========================================================
+#                  All Tasks (simple table)
+# =========================================================
+st.subheader("All Tasks")
+if df.empty:
+    st.info("No tasks yet.")
+else:
+    show = df.copy()
+    show = show[["id","Unit","Subcategory","Task","Status","Owner","DueDate","Week","Notes"]].sort_values(["Unit","Subcategory","DueDate","Task"])
+    # pretty date
+    show["DueDate"] = show["DueDate"].dt.date
+    st.dataframe(show, use_container_width=True, hide_index=True)
 
-    conn = get_conn()
-    st.dataframe(pd.read_sql_query("SELECT * FROM sla_policies", conn), use_container_width=True, hide_index=True)
-    conn.close()
-
-# -------------------- OWNERS TAB --------------------
-with tabs[3]:
-    st.subheader("Owners")
-    with st.form("owners_form", clear_on_submit=True):
-        c1, c2, c3, c4 = st.columns(4)
-        Owner = c1.text_input("Owner*")
-        Email = c2.text_input("Email")
-        Role = c3.text_input("Role")
-        Unit = c4.text_input("Unit")
-        submit = st.form_submit_button("➕ Add Owner")
-        if submit:
-            if not Owner:
-                st.error("Owner is required.")
-            else:
-                conn = get_conn()
-                conn.execute("INSERT INTO owners(Owner,Email,Role,Unit) VALUES(?,?,?,?)",
-                             (Owner, Email, Role, Unit))
-                conn.commit()
-                conn.close()
-                auto_backup_now()
-                st.success("✅ Owner added & backup updated.")
-
-    conn = get_conn()
-    st.dataframe(pd.read_sql_query("SELECT * FROM owners", conn), use_container_width=True, hide_index=True)
-    conn.close()
-
-# -------------------- DASHBOARD TAB --------------------
-with tabs[4]:
-    st.subheader("Dashboard & Export")
-    tzinfo = tz.gettz(st.session_state.get("tz", "Asia/Riyadh"))
-    today = dt.datetime.now(tzinfo).date()
-    df = load_df()
-    if df.empty:
-        st.info("No tasks yet.")
-    else:
-        processed = process_df(df, today, due_soon_days=st.session_state["due_soon_days"])
-        c1, c2, c3, c4, c5 = st.columns(5)
-        total = len(processed)
-        done_pct = float(processed["Is_Done"].mean() * 100) if total else 0.0
-        c1.metric("Total Tasks", total)
-        c2.metric("Done %", f"{done_pct:.1f}%")
-        c3.metric("Overdue", int(processed["Is_Overdue"].sum()))
-        c4.metric("Due Soon", int(processed["Is_DueSoon"].sum()))
-        c5.metric("SLA Breach", int(processed["SLA_Breach"].sum()))
-
-        st.dataframe(processed, use_container_width=True, hide_index=True)
-
-        out_bytes = export_excel(processed)
-        st.download_button(
-            "⬇️ Download FollowUp_Output.xlsx",
-            data=out_bytes,
-            file_name="FollowUp_Output.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-# -------------------- IMPORT TAB --------------------
-with tabs[5]:
-    st.subheader("Import Excel (optional)")
-    up = st.file_uploader("Upload an Excel with 'Tasks_Input' sheet", type=["xlsx", "xlsm"])
-    if up is not None:
-        try:
-            xls = pd.ExcelFile(up.read())
-            if "Tasks_Input" in xls.sheet_names:
-                df_in = pd.read_excel(xls, sheet_name="Tasks_Input")
-            else:
-                df_in = pd.read_excel(xls, sheet_name=xls.sheet_names[0])
-
-            info = pd.read_sql_query("PRAGMA table_info(tasks)", get_conn())
-            known_cols = info["name"].tolist()
-            keep_cols = [c for c in df_in.columns if c in known_cols]
-            df_in = df_in[keep_cols].copy()
-
-            conn = get_conn()
-            for _, r in df_in.iterrows():
-                cols = [c for c in r.index if not pd.isna(r[c])]
-                vals = [str(r[c].date()) if hasattr(r[c], "date") else r[c] for c in cols]
-                q = f"INSERT INTO tasks ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})"
-                conn.execute(q, vals)
-            conn.commit()
-            conn.close()
-            auto_backup_now()
-            st.success(f"Imported {len(df_in)} rows into tasks & saved backup.")
-        except Exception as e:
-            st.error(f"Import failed: {e}")
+# =========================================================
+#                  Quick export (optional)
+# =========================================================
+st.download_button(
+    "⬇️ Download current tasks (CSV)",
+    data=df.to_csv(index=False).encode("utf-8"),
+    file_name="followup_tasks_export.csv",
+    mime="text/csv",
+)
