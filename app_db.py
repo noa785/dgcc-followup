@@ -15,19 +15,11 @@ st.title("Follow-up Manager")
 
 # ---------- Helpers ----------
 CANON_STATUS = {
-    "done": "Done",
-    "completed": "Done",
-    "finished": "Done",
-    "under progress": "Under Progress",
-    "in progress": "Under Progress",
-    "progress": "Under Progress",
-    "not done": "Not Done",
-    "todo": "Not Done",
-    "pending": "Not Done",
-    "rescheduled": "Rescheduled",
-    "deferred": "Rescheduled",
-    "blocked": "Blocked",
-    "on hold": "Blocked",
+    "done": "Done", "completed": "Done", "finished": "Done",
+    "under progress": "Under Progress", "in progress": "Under Progress", "progress": "Under Progress",
+    "not done": "Not Done", "todo": "Not Done", "pending": "Not Done",
+    "rescheduled": "Rescheduled", "deferred": "Rescheduled",
+    "blocked": "Blocked", "on hold": "Blocked",
 }
 STATUS_ORDER = ["Overdue", "Due Soon", "Under Progress", "Not Done", "Rescheduled", "Blocked", "Done"]
 
@@ -117,6 +109,7 @@ def get_approved_map():
 
 def process_df(df, today, due_soon_days=3):
     df = df.copy()
+
     # apply approvals
     appr = get_approved_map()
     if "Change_Request_ID" in df.columns and len(appr):
@@ -174,12 +167,19 @@ def process_df(df, today, due_soon_days=3):
     return df
 
 def export_excel(df_processed):
-    piv_status = df_processed.pivot_table(index="Status_Final", values="Task", aggfunc="count", fill_value=0).rename(columns={"Task":"Count"}).reset_index()
-    piv_unit = df_processed.pivot_table(index="Unit", columns="Status_Final", values="Task", aggfunc="count", fill_value=0).reset_index()
-    piv_week = df_processed.pivot_table(index="Week", columns="Status_Final", values="Task", aggfunc="count", fill_value=0).reset_index()
-    piv_pri = df_processed.pivot_table(index="Priority", columns="Status_Final", values="Task", aggfunc="count", fill_value=0).reset_index()
-    piv_sla = df_processed.assign(SLA_State=df_processed["SLA_Breach"].map({True:"Breach", False:"OK"})).pivot_table(index="SLA_State", values="Task", aggfunc="count", fill_value=0).rename(columns={"Task":"Count"}).reset_index()
-    piv_owner = df_processed.pivot_table(index="Owner", columns="Status_Final", values="Task", aggfunc="count", fill_value=0).reset_index()
+    piv_status = df_processed.pivot_table(index="Status_Final", values="Task", aggfunc="count", fill_value=0)\
+                             .rename(columns={"Task":"Count"}).reset_index()
+    piv_unit = df_processed.pivot_table(index="Unit", columns="Status_Final", values="Task", aggfunc="count", fill_value=0)\
+                           .reset_index()
+    piv_week = df_processed.pivot_table(index="Week", columns="Status_Final", values="Task", aggfunc="count", fill_value=0)\
+                           .reset_index()
+    piv_pri = df_processed.pivot_table(index="Priority", columns="Status_Final", values="Task", aggfunc="count", fill_value=0)\
+                          .reset_index()
+    piv_sla = df_processed.assign(SLA_State=df_processed["SLA_Breach"].map({True:"Breach", False:"OK"}))\
+                          .pivot_table(index="SLA_State", values="Task", aggfunc="count", fill_value=0)\
+                          .rename(columns={"Task":"Count"}).reset_index()
+    piv_owner = df_processed.pivot_table(index="Owner", columns="Status_Final", values="Task", aggfunc="count", fill_value=0)\
+                            .reset_index()
 
     kpi = pd.DataFrame([
         ["Total Tasks", len(df_processed)],
@@ -231,7 +231,7 @@ with st.sidebar:
     st.header("⚙️ Options")
     st.session_state["due_soon_days"] = st.number_input("Due soon window (days)", min_value=1, max_value=14, value=3, step=1)
     tz_name = st.text_input("Timezone", value=st.session_state.get("tz", "Asia/Riyadh"))
-    st.session_state["tz"] = tz_name  # keep in session for processing/export
+    st.session_state["tz"] = tz_name
     st.caption("Backups auto-save to ./backups and an Excel snapshot is saved as FollowUp_AutoBackup.xlsx")
 
 # ---------- First run ----------
@@ -242,46 +242,57 @@ init_db()
 # --- Tasks ---
 st.header("Tasks")
 
+# Helper: clear just key text fields after "Save & New"
+def _reset_for_next():
+    for k in ["Unit","Role","Task","Owner","Subcategory","Notes","Change_Request_ID"]:
+        st.session_state[k] = ""
+    # keep week/dates/priority/category to speed up repeated entry
+
 st.subheader("Add / Edit Task")
-with st.form("task_form", clear_on_submit=True):
+with st.form("task_form", clear_on_submit=False):
     c1, c2, c3, c4 = st.columns(4)
-    Unit = c1.text_input("Unit")
-    Role = c2.text_input("Role")
-    Task = c3.text_input("Task*", placeholder="Required")
-    Week = c4.number_input("Week", min_value=1, max_value=55, value=38)
+    Unit = c1.text_input("Unit", key="Unit")
+    Role = c2.text_input("Role", key="Role")
+    Task = c3.text_input("Task*", placeholder="Required", key="Task")
+    Week = c4.number_input("Week", min_value=1, max_value=55, value=38, key="Week")
 
     c5, c6, c7, c8 = st.columns(4)
-    Status = c5.selectbox("Status", ["", "Not Done", "Under Progress", "Rescheduled", "Blocked", "Done"])
-    StartDate = c6.date_input("StartDate", value=None, format="YYYY-MM-DD")
-    DueDate = c7.date_input("DueDate*", value=dt.date.today(), format="YYYY-MM-DD")
-    RescheduledTo = c8.date_input("RescheduledTo", value=None, format="YYYY-MM-DD")
+    Status = c5.selectbox("Status", ["", "Not Done", "Under Progress", "Rescheduled", "Blocked", "Done"], key="Status")
+    StartDate = c6.date_input("StartDate", value=None, format="YYYY-MM-DD", key="StartDate")
+    DueDate = c7.date_input("DueDate*", value=dt.date.today(), format="YYYY-MM-DD", key="DueDate")
+    RescheduledTo = c8.date_input("RescheduledTo", value=None, format="YYYY-MM-DD", key="RescheduledTo")
 
     c9, c10, c11, c12 = st.columns(4)
-    Owner = c9.text_input("Owner")
-    Priority = c10.selectbox("Priority", ["", "Critical", "High", "Medium", "Low"])
+    Owner = c9.text_input("Owner", key="Owner")
+    Priority = c10.selectbox("Priority", ["", "Critical", "High", "Medium", "Low"], key="Priority")
     Category = c11.selectbox(
         "Category",
         ["", "Data Cleaning", "File Merge/ETL", "Scheduling", "Reporting", "Dashboard",
          "Access/Permissions", "Integration", "Automation", "Bug Fix", "Change Request",
-         "Governance", "Documentation", "Training/Workshop"]
+         "Governance", "Documentation", "Training/Workshop"],
+        key="Category"
     )
-    Subcategory = c12.text_input("Subcategory")
+    Subcategory = c12.text_input("Subcategory", key="Subcategory")
 
     c13, c14, c15, c16 = st.columns(4)
-    CreatedOn = c13.date_input("CreatedOn", value=dt.date.today(), format="YYYY-MM-DD")
-    CompletedOn = c14.date_input("CompletedOn", value=None, format="YYYY-MM-DD")
-    SLA_TargetDays = c15.number_input("SLA Target Days", min_value=0, max_value=365, value=0)
-    Change_Request_ID = c16.text_input("Change Request ID")
+    CreatedOn = c13.date_input("CreatedOn", value=dt.date.today(), format="YYYY-MM-DD", key="CreatedOn")
+    CompletedOn = c14.date_input("CompletedOn", value=None, format="YYYY-MM-DD", key="CompletedOn")
+    SLA_TargetDays = c15.number_input("SLA Target Days", min_value=0, max_value=365, value=0, key="SLA_TargetDays")
+    Change_Request_ID = c16.text_input("Change Request ID", key="Change_Request_ID")
 
-    Notes = st.text_area("Notes")
+    Notes = st.text_area("Notes", key="Notes")
 
-    submitted = st.form_submit_button("➕ Add Task")
-    if submitted:
+    b1, b2 = st.columns(2)
+    save = b1.form_submit_button("💾 Save")
+    save_new = b2.form_submit_button("💾 Save & New")
+
+    if save or save_new:
         if not Task or not DueDate:
             st.error("Task and DueDate are required.")
         else:
             row = dict(
-                Unit=Unit, Role=Role, Task=Task, Week=int(Week), Status=Status or None,
+                Unit=Unit or None, Role=Role or None, Task=Task, Week=int(Week),
+                Status=Status or None,
                 StartDate=str(StartDate) if StartDate else None,
                 DueDate=str(DueDate),
                 RescheduledTo=str(RescheduledTo) if RescheduledTo else None,
@@ -298,7 +309,10 @@ with st.form("task_form", clear_on_submit=True):
             )
             upsert_task(row)
             auto_backup_now()
-            st.success("✅ Task added & backup saved.")
+            st.success("✅ Task saved.")
+            if save_new:
+                _reset_for_next()
+                st.experimental_rerun()
 
 st.divider()
 st.subheader("All Tasks")
