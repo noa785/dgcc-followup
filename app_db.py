@@ -1,238 +1,211 @@
-import streamlit as st
-import pandas as pd
+# app.py
 import io
+import pandas as pd
+import streamlit as st
 import datetime as dt
 from dateutil import tz
-from pathlib import Path
-import shutil
+from supabase import create_client
+from db_core import (
+    init_db, insert_deliverable, insert_task, fetch_deliverables,
+    fetch_tasks_flat, delete_deliverable, insert_archive, fetch_archives
+)
 
-# your existing DB helpers
-from db_core import init_db, get_conn, get_db_path
+# ----------------------- Config -----------------------
+TZ = st.secrets.get("app", {}).get("timezone", "Asia/Riyadh")
+SUPA_URL = st.secrets["supabase"]["url"]
+SUPA_KEY = st.secrets["supabase"]["anon_key"]
+SUPA_BUCKET = st.secrets["supabase"]["bucket"]
+supabase = create_client(SUPA_URL, SUPA_KEY)
 
-# ---------------- Page ----------------
-st.set_page_config(page_title="Follow-up Manager", layout="wide")
+st.set_page_config(page_title="Follow-up Manager", page_icon="🗂️", layout="wide")
 st.title("Follow-up Manager")
 
-# ---------- Canonical status mapping (simple) ----------
-SIMPLE_TO_CANON = {
-    "Not started": "Not Done",
-    "In progress": "Under Progress",
-    "Blocked": "Blocked",
-    "Rescheduled": "Rescheduled",
-    "Done": "Done",
-}
-
-STATUS_CHOICES = list(SIMPLE_TO_CANON.keys())
-
-def canon_status(label: str) -> str:
-    return SIMPLE_TO_CANON.get(label, "Not Done")
-
-# ---------- Utilities ----------
-def to_date(x):
-    if x in [None, "", "None"]:
-        return None
-    try:
-        d = pd.to_datetime(x, errors="coerce")
-        if pd.isna(d):
-            return None
-        return d.date()
-    except Exception:
-        return None
-
-def compute_week(d):
-    try:
-        return int(pd.to_datetime(d).isocalendar().week)
-    except Exception:
-        return None
-
-# -------- Auto-backup --------
-def _ensure_backup_dir() -> Path:
-    p = Path("backups")
-    p.mkdir(exist_ok=True)
-    return p
-
-def auto_backup_now():
-    db_path = get_db_path()
-    if db_path.exists():
-        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        dst = _ensure_backup_dir() / f"followup_{ts}.db"
-        shutil.copy2(db_path, dst)
-
-# ---------- DB I/O ----------
-def load_tasks() -> pd.DataFrame:
-    conn = get_conn()
-    try:
-        return pd.read_sql_query("SELECT * FROM tasks", conn)
-    finally:
-        conn.close()
-
-def insert_task(row: dict):
-    cols = list(row.keys())
-    vals = [row[c] for c in cols]
-    q = f"INSERT INTO tasks ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})"
-    conn = get_conn()
-    try:
-        conn.execute(q, vals)
-        conn.commit()
-    finally:
-        conn.close()
-
-# ---------- Sidebar ----------
-with st.sidebar:
-    st.header("⚙️ Options")
-    tz_name = st.text_input("Timezone", value=st.session_state.get("tz", "Asia/Riyadh"))
-    st.session_state["tz"] = tz_name
-    st.caption("Saves to SQLite and auto-backs up after every change.")
-
-# ---------- First run ----------
+# ----------------------- Init DB ----------------------
 init_db()
 
-# =========================================================
-#           SIMPLE: Add Deliverable + up to 5 Tasks
-# =========================================================
+# ----------------------- Helpers ---------------------
+STATUSES = ["Not started", "In progress", "Blocked", "Done"]
+
+def upload_to_storage(data: bytes, path: str, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") -> str:
+    # upsert=true to overwrite same path
+    supabase.storage.from_(SUPA_BUCKET).upload(path, data, {"upsert": "true", "contentType": content_type})
+    return supabase.storage.from_(SUPA_BUCKET).get_public_url(path)
+
+def export_all_to_excel() -> bytes:
+    """One Excel with two sheets: Deliverables & Tasks (flat)."""
+    dels = fetch_deliverables()
+    tasks = fetch_tasks_flat()
+    df_dels = pd.DataFrame([{
+        "id": d["id"], "unit": d["unit"], "deliverable": d["name"], "owner": d["owner"],
+        "notes": d["notes"], "due_date": d["due_date"], "created_at": d["created_at"]
+    } for d in dels])
+    df_tasks = pd.DataFrame(tasks or [])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
+        (df_dels if not df_dels.empty else pd.DataFrame()).to_excel(xl, index=False, sheet_name="Deliverables")
+        (df_tasks if not df_tasks.empty else pd.DataFrame()).to_excel(xl, index=False, sheet_name="Tasks")
+    buf.seek(0)
+    return buf.read()
+
+def archive_selection(ids:list[int], title:str) -> str:
+    """Create an Excel containing chosen deliverables + tasks and upload to Storage."""
+    # Build data
+    all_d = fetch_deliverables()
+    selected = [d for d in all_d if d["id"] in ids]
+    rows_d = [{
+        "id": d["id"], "unit": d["unit"], "deliverable": d["name"],
+        "owner": d["owner"], "notes": d["notes"], "due_date": d["due_date"], "created_at": d["created_at"]
+    } for d in selected]
+    rows_t = []
+    for d in selected:
+        for t in (d["tasks"] or []):
+            rows_t.append({
+                "deliverable_id": d["id"],
+                "deliverable": d["name"],
+                "unit": d["unit"],
+                "task_id": t["id"],
+                "title": t["title"],
+                "status": t["status"],
+                "owner": t["owner"],
+                "due_date": t["due_date"],
+            })
+    # Excel
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
+        pd.DataFrame(rows_d).to_excel(xl, index=False, sheet_name="Deliverables")
+        pd.DataFrame(rows_t).to_excel(xl, index=False, sheet_name="Tasks")
+    buf.seek(0)
+    # Upload
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = f"archives/{title}_{ts}.xlsx"
+    url = upload_to_storage(buf.getvalue(), path)
+    # Record archive row
+    insert_archive(title=title, file_url=url, items_count=len(selected))
+    return url
+
+# ----------------------- Sidebar ----------------------
+with st.sidebar:
+    st.header("⚙️ Options")
+    due_soon_days = st.number_input("Due soon window (days)", 1, 30, 3)
+    st.caption("All data is saved in Postgres. Excel backups go to Supabase Storage.")
+
+# ----------------------- Add Deliverable & Tasks ----------------------
 st.subheader("Add Deliverable & Tasks")
 
 with st.form("deliverable_form", clear_on_submit=True):
-    c1, c2, c3 = st.columns([1.1, 1.2, 0.7])
-    Unit = c1.text_input("Unit*", placeholder="e.g., ODU")
-    Deliverable = c2.text_input("Deliverable / Project*", placeholder="e.g., Monthly Dashboard")
-    Deliv_Due = c3.date_input("Deliverable Due (optional)", value=None, format="YYYY-MM-DD")
-
-    c4, c5 = st.columns([1, 1])
-    Deliv_Owner = c4.text_input("Deliverable Owner (optional)")
-    Deliv_Notes = c5.text_input("Notes (optional)")
+    c1, c2, c3 = st.columns([1, 2, 1])
+    unit = c1.text_input("Unit*", placeholder="e.g., ODU")
+    deliverable = c2.text_input("Deliverable / Project*", placeholder="e.g., Monthly Dashboard")
+    due_date = c3.date_input("Deliverable Due (optional)", value=None, format="YYYY-MM-DD")
+    c4, c5 = st.columns([1, 2])
+    d_owner = c4.text_input("Deliverable Owner (optional)")
+    d_notes = c5.text_input("Notes (optional)")
 
     st.markdown("**Tasks (add 1–5; leave blank rows empty):**")
-    task_rows = []
+    rows = []
     for i in range(1, 6):
-        r1, r2, r3, r4 = st.columns([2.2, 1.2, 1.2, 1.1])
-        t_title = r1.text_input(f"Task {i} title", placeholder="e.g., Collect inputs")
-        t_status = r2.selectbox(f"Status {i}", STATUS_CHOICES, index=0, key=f"st_{i}")
-        t_owner  = r3.text_input(f"Owner {i}", placeholder="(optional)")
-        t_due    = r4.date_input(f"Due {i}", value=None, format="YYYY-MM-DD", key=f"due_{i}")
-        task_rows.append((t_title, t_status, t_owner, t_due))
+        t1, t2, t3 = st.columns([2, 1, 1])
+        title = t1.text_input(f"Task {i} title", key=f"title{i}", placeholder="e.g., Collect inputs")
+        status = t2.selectbox(f"Status {i}", STATUSES, index=0, key=f"status{i}")
+        due = t3.date_input(f"Due {i}", value=None, key=f"due{i}", format="YYYY-MM-DD")
+        o1 = st.text_input(f"Owner {i} (optional)", key=f"owner{i}")
+        rows.append({"title": title, "status": status, "owner": o1, "due": due})
 
-    submitted = st.form_submit_button("➕ Save deliverable & tasks")
-
-    if submitted:
-        if not Unit or not Deliverable:
-            st.error("Please fill **Unit** and **Deliverable / Project**.")
+    submit = st.form_submit_button("➕ Save deliverable & tasks")
+    if submit:
+        if not unit or not deliverable:
+            st.error("Unit and Deliverable are required.")
         else:
-            added = 0
-            for (t_title, t_status, t_owner, t_due) in task_rows:
-                if not t_title.strip():
-                    continue  # skip blank row
+            did = insert_deliverable(
+                unit=unit.strip(),
+                name=deliverable.strip(),
+                owner=(d_owner or None),
+                notes=(d_notes or None),
+                due_date=str(due_date) if due_date else None
+            )
+            count = 0
+            for r in rows:
+                if r["title"].strip():
+                    insert_task(
+                        deliverable_id=did,
+                        title=r["title"].strip(),
+                        status=r["status"],
+                        owner=(r["owner"] or None),
+                        due_date=str(r["due"]) if r["due"] else None
+                    )
+                    count += 1
+            st.success(f"Saved ✅  Deliverable '{deliverable}' with {count} task(s).")
 
-                due_str = str(t_due) if t_due else (str(Deliv_Due) if Deliv_Due else None)
-                week = compute_week(due_str) if due_str else None
+# ----------------------- List & Manage ----------------------
+st.subheader("Deliverables")
+dels = fetch_deliverables()
 
-                row = dict(
-                    Unit=Unit.strip(),
-                    Role=None,
-                    Task=t_title.strip(),
-                    Week=week,
-                    Status=canon_status(t_status),
-                    StartDate=None,
-                    DueDate=due_str,
-                    RescheduledTo=None,
-                    Owner=(t_owner or Deliv_Owner or None),
-                    Notes=Deliv_Notes or None,
-                    Priority=None,
-                    Category=None,
-                    Subcategory=Deliverable.strip(),  # GROUP BY deliverable
-                    Complexity=None, EffortHours=None, Dependency=None, Blocker=None, RiskLevel=None,
-                    SLA_TargetDays=None,
-                    CreatedOn=str(dt.date.today()),
-                    CompletedOn=None,
-                    QA_Status=None, QA_Reviewer=None, Approval_Status=None, Approval_By=None,
-                    KPI_Impact=None, KPI_Name=None, Budget_SAR=None, ActualCost_SAR=None,
-                    Benefit_Score=None, Benefit_Notes=None, UAT_Date=None, Release_ID=None,
-                    Change_Request_ID=None, Tags=None,
-                )
-                insert_task(row)
-                added += 1
-
-            if added:
-                auto_backup_now()
-                st.success(f"✅ Saved **{added} task(s)** under deliverable **{Deliverable}**.")
+# Quick grid: 3 per row (cards)
+if not dels:
+    st.info("No deliverables yet.")
+else:
+    # Archive builder
+    with st.expander("📦 Create an archive from selected deliverables"):
+        selectable = {f"#{d['id']} — {d['unit']} / {d['name']}": d["id"] for d in dels}
+        selected = st.multiselect("Choose deliverables (any number)", list(selectable.keys()))
+        title = st.text_input("Archive title", value="Batch")
+        if st.button("Create archive"):
+            if not selected:
+                st.warning("Pick at least one deliverable.")
             else:
-                st.info("No tasks entered. Nothing saved.")
+                ids = [selectable[k] for k in selected]
+                url = archive_selection(ids, title)
+                st.success(f"Archive created → {url}")
 
-st.divider()
+    # Cards
+    cols = st.columns(3)
+    for i, d in enumerate(dels):
+        with cols[i % 3]:
+            st.markdown(
+                f"""
+                <div style="padding:14px;border:1px solid #e5e7eb;border-radius:14px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.05);margin-bottom:14px;">
+                  <div style="font-size:18px;font-weight:700;margin-bottom:4px;">{d['unit']} — {d['name']}</div>
+                  <div style="color:#6b7280;font-size:13px;margin-bottom:6px;">Owner: {d.get('owner') or '—'} | Due: {d.get('due_date') or '—'}</div>
+                  <div style="color:#374151;font-size:14px;">{d.get('notes') or ''}</div>
+                  <div style="margin-top:10px;color:#6b7280;font-size:13px;">Tasks: {len(d['tasks'] or [])}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-# =========================================================
-#           Deliverables Overview (grouped & compact)
-# =========================================================
-st.subheader("Deliverables Overview")
+    st.markdown("### All tasks (flat)")
+    tasks = fetch_tasks_flat()
+    df_tasks = pd.DataFrame(tasks or [])
+    if df_tasks.empty:
+        st.caption("No tasks yet.")
+    else:
+        # Small computed flags
+        tzinfo = tz.gettz(TZ)
+        today = dt.datetime.now(tzinfo).date()
+        def due_status(row):
+            d = row.get("due_date")
+            if not d: return ""
+            d = pd.to_datetime(d).date()
+            if (row.get("status") or "").lower() == "done": return "Done"
+            if d < today: return "Overdue"
+            if 0 <= (d - today).days <= st.session_state.get("due_soon_days", 3): return "Due soon"
+            return ""
+        df_tasks["DueFlag"] = df_tasks.apply(due_status, axis=1)
+        st.dataframe(df_tasks, use_container_width=True, hide_index=True)
 
-df = load_tasks()
-if df.empty:
-    st.info("No data yet. Add your first deliverable above.")
+    st.markdown("---")
+    # Backup/export buttons
+    exp = export_all_to_excel()
+    st.download_button("⬇️ Download full Excel snapshot", exp, file_name="FollowUp_Full.xlsx")
+    if st.button("☁️ Save full backup to cloud"):
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        url = upload_to_storage(exp, f"backups/FollowUp_Backup_{ts}.xlsx")
+        st.success(f"Backup saved → {url}")
+
+# ----------------------- Archives List ----------------------
+st.subheader("Archives")
+arch = fetch_archives()
+if not arch:
+    st.caption("No archives yet.")
 else:
-    # normalize useful cols
-    df["DueDate"] = pd.to_datetime(df["DueDate"], errors="coerce")
-    df["Subcategory"] = df["Subcategory"].fillna("")  # Deliverable
-    df["Unit"] = df["Unit"].fillna("")
-    today = pd.Timestamp(dt.datetime.now(tz.gettz(st.session_state["tz"]))).normalize()
-
-    # quick flags
-    done = df["Status"].eq("Done")
-    overdue = (~done) & df["DueDate"].notna() & (df["DueDate"] < today)
-    due_soon = (~done) & df["DueDate"].notna() & (df["DueDate"] >= today) & ((df["DueDate"] - today).dt.days <= 3)
-
-    grp = (df.assign(IsDone=done, IsOverdue=overdue, IsSoon=due_soon)
-             .groupby(["Unit", "Subcategory"], dropna=False)
-             .agg(Total=("Task","count"),
-                  Done=("IsDone","sum"),
-                  Overdue=("IsOverdue","sum"),
-                  DueSoon=("IsSoon","sum"),
-                  DueMin=("DueDate","min"),
-                  DueMax=("DueDate","max"))
-             .reset_index())
-
-    # display compact grid (horizontally)
-    for unit, df_u in grp.groupby("Unit"):
-        st.markdown(f"### Unit: {unit or '—'}")
-        cols = st.columns(3)
-        k = 0
-        for _, row in df_u.sort_values(["DueMin","Subcategory"]).iterrows():
-            with cols[k % 3]:
-                st.markdown(
-                    f"""<div style="padding:14px;border:1px solid #e5e7eb;border-radius:12px;background:#fff;">
-                        <div style="font-weight:600;font-size:18px;margin-bottom:6px;">{row['Subcategory'] or 'Unnamed deliverable'}</div>
-                        <div style="color:#6b7280;margin-bottom:6px;">
-                          Total: {int(row['Total'])} • Done: {int(row['Done'])} •
-                          Due soon: {int(row['DueSoon'])} • Overdue: {int(row['Overdue'])}
-                        </div>
-                        <div style="color:#6b7280;">Due range: {'' if pd.isna(row['DueMin']) else str(row['DueMin'].date())}
-                        {" — " if not pd.isna(row['DueMax']) and not pd.isna(row['DueMin']) else ""}
-                        {'' if pd.isna(row['DueMax']) else str(row['DueMax'].date())}</div>
-                    </div>""",
-                    unsafe_allow_html=True
-                )
-            k += 1
-
-st.divider()
-
-# =========================================================
-#                  All Tasks (simple table)
-# =========================================================
-st.subheader("All Tasks")
-if df.empty:
-    st.info("No tasks yet.")
-else:
-    show = df.copy()
-    show = show[["id","Unit","Subcategory","Task","Status","Owner","DueDate","Week","Notes"]].sort_values(["Unit","Subcategory","DueDate","Task"])
-    # pretty date
-    show["DueDate"] = show["DueDate"].dt.date
-    st.dataframe(show, use_container_width=True, hide_index=True)
-
-# =========================================================
-#                  Quick export (optional)
-# =========================================================
-st.download_button(
-    "⬇️ Download current tasks (CSV)",
-    data=df.to_csv(index=False).encode("utf-8"),
-    file_name="followup_tasks_export.csv",
-    mime="text/csv",
-)
+    st.dataframe(pd.DataFrame(arch), use_container_width=True, hide_index=True)
