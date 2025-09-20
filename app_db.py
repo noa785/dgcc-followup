@@ -240,13 +240,61 @@ tabs = st.tabs([
 
 # -------------------- TASKS TAB --------------------
 with tabs[0]:
+    st.subheader("Tasks")
+
+    # Load once for choices/filters
+    df_all = load_df()
+
+    # ---- Quick add the same task to many units ----
+    with st.expander("⚡ Quick add: same task for many units", expanded=False):
+        unit_choices = sorted([u for u in df_all["Unit"].dropna().unique().tolist() if str(u).strip()]) if not df_all.empty else []
+        bulk_units = st.multiselect("Units*", unit_choices, help="Select the units to create a task for each one")
+
+        c1, c2, c3, c4 = st.columns(4)
+        bulk_task = c1.text_input("Task*", placeholder="Required")
+        bulk_due = c2.date_input("DueDate*", value=dt.date.today(), format="YYYY-MM-DD")
+        bulk_status = c3.selectbox("Status", ["", "Not Done", "Under Progress", "Rescheduled", "Blocked", "Done"])
+        bulk_priority = c4.selectbox("Priority", ["", "Critical", "High", "Medium", "Low"])
+
+        c5, c6 = st.columns(2)
+        bulk_category = c5.selectbox(
+            "Category",
+            ["", "Data Cleaning", "File Merge/ETL", "Scheduling", "Reporting", "Dashboard",
+             "Access/Permissions", "Integration", "Automation", "Bug Fix", "Change Request",
+             "Governance", "Documentation", "Training/Workshop"]
+        )
+        bulk_week = c6.number_input("Week", min_value=1, max_value=55, value=dt.date.today().isocalendar().week)
+
+        bulk_notes = st.text_area("Notes (optional)")
+        if st.button("➕ Add for all selected units"):
+            if not bulk_units or not bulk_task:
+                st.error("Please select at least one Unit and enter Task.")
+            else:
+                for u in bulk_units:
+                    row = dict(
+                        Unit=u, Role=None, Task=bulk_task, Week=int(bulk_week),
+                        Status=bulk_status or None,
+                        StartDate=None, DueDate=str(bulk_due), RescheduledTo=None,
+                        Owner=None, Notes=bulk_notes or None, Priority=bulk_priority or None,
+                        Category=bulk_category or None, Subcategory=None,
+                        Complexity=None, EffortHours=None, Dependency=None, Blocker=None, RiskLevel=None,
+                        SLA_TargetDays=None, CreatedOn=str(dt.date.today()), CompletedOn=None,
+                        QA_Status=None, QA_Reviewer=None, Approval_Status=None, Approval_By=None,
+                        KPI_Impact=None, KPI_Name=None, Budget_SAR=None, ActualCost_SAR=None,
+                        Benefit_Score=None, Benefit_Notes=None, UAT_Date=None, Release_ID=None,
+                        Change_Request_ID=None, Tags=None
+                    )
+                    upsert_task(row)
+                auto_backup_now()
+                st.success(f"✅ Added '{bulk_task}' for {len(bulk_units)} unit(s).")
+                st.experimental_rerun()
+
+    # ---- Add / Edit Task (single) ----
     st.subheader("Add / Edit Task")
 
-    # Helper to clear quick fields after "Save & New"
     def _reset_for_next():
         for k in ["Unit","Role","Task","Owner","Subcategory","Notes","Change_Request_ID"]:
             st.session_state[k] = ""
-        # keep week/dates/category/priority
 
     with st.form("task_form", clear_on_submit=False):
         c1, c2, c3, c4 = st.columns(4)
@@ -315,12 +363,82 @@ with tabs[0]:
 
     st.divider()
     st.subheader("All Tasks")
+
     df = load_df()
     if df.empty:
         st.info("No tasks yet. Add your first task above.")
     else:
+        # ---- Filter bar (Units + Week/Month/Custom) ----
+        with st.expander("🔎 Filter tasks by unit and period", expanded=True):
+            unit_options = sorted([u for u in df["Unit"].dropna().unique().tolist() if str(u).strip()])
+            sel_units = st.multiselect("Units", unit_options, help="Leave empty to include all units")
+
+            period = st.selectbox("Period", ["All", "This week", "This month", "Custom range"], index=1)
+            date_from, date_to = None, None
+            today = dt.date.today()
+            if period == "This week":
+                date_from = today - dt.timedelta(days=today.weekday())
+                date_to = date_from + dt.timedelta(days=6)
+            elif period == "This month":
+                date_from = today.replace(day=1)
+                next_month = (date_from.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+                date_to = next_month - dt.timedelta(days=1)
+            elif period == "Custom range":
+                cA, cB = st.columns(2)
+                date_from = cA.date_input("From (DueDate)", value=today.replace(day=1))
+                date_to = cB.date_input("To (DueDate)", value=today)
+
+            view = df.copy()
+            if sel_units:
+                view = view[view["Unit"].isin(sel_units)]
+            if date_from and date_to:
+                view = view[
+                    (pd.to_datetime(view["DueDate"], errors="coerce").dt.date >= date_from) &
+                    (pd.to_datetime(view["DueDate"], errors="coerce").dt.date <= date_to)
+                ]
+            if "Week" in view.columns:
+                view = view.sort_values(["Week", "Unit", "DueDate"], kind="stable")
+            st.write(f"Showing {len(view)} task(s).")
+            st.dataframe(view, use_container_width=True, hide_index=True)
+
+        # ---- Add multiple rows manually (optional) ----
+        with st.expander("📝 Add multiple rows (manual)", expanded=False):
+            template = pd.DataFrame([{
+                "Unit":"", "Task":"", "DueDate": dt.date.today(),
+                "Week": dt.date.today().isocalendar().week, "Status":"Not Done",
+                "Priority":"", "Category":""
+            }])
+            new_rows = st.data_editor(template, num_rows="dynamic", use_container_width=True)
+            if st.button("💾 Save all rows"):
+                count = 0
+                for _, r in new_rows.iterrows():
+                    if str(r.get("Task") or "").strip() == "":
+                        continue
+                    row = dict(
+                        Unit=str(r.get("Unit") or None), Role=None, Task=str(r.get("Task")),
+                        Week=int(r.get("Week") or dt.date.today().isocalendar().week),
+                        Status=str(r.get("Status") or None),
+                        StartDate=None, DueDate=str(r.get("DueDate") or dt.date.today()), RescheduledTo=None,
+                        Owner=None, Notes=None, Priority=str(r.get("Priority") or None),
+                        Category=str(r.get("Category") or None), Subcategory=None,
+                        Complexity=None, EffortHours=None, Dependency=None, Blocker=None, RiskLevel=None,
+                        SLA_TargetDays=None, CreatedOn=str(dt.date.today()), CompletedOn=None,
+                        QA_Status=None, QA_Reviewer=None, Approval_Status=None, Approval_By=None,
+                        KPI_Impact=None, KPI_Name=None, Budget_SAR=None, ActualCost_SAR=None,
+                        Benefit_Score=None, Benefit_Notes=None, UAT_Date=None, Release_ID=None,
+                        Change_Request_ID=None, Tags=None
+                    )
+                    upsert_task(row)
+                    count += 1
+                if count:
+                    auto_backup_now()
+                    st.success(f"✅ Saved {count} row(s).")
+                    st.experimental_rerun()
+
+        # ---- Simple edit/delete controls ----
+        st.markdown("### Edit / Delete")
         edited_id = st.number_input("Edit Task ID", min_value=0, value=0, step=1,
-                                    help="Enter the 'id' to edit; see table below.")
+                                    help="Enter the 'id' to edit; see table above.")
         if edited_id:
             row = df.loc[df["id"] == edited_id]
             if not row.empty:
@@ -350,8 +468,6 @@ with tabs[0]:
                 delete_task(del_id)
                 auto_backup_now()
                 st.success("✅ Deleted & backup updated.")
-
-        st.dataframe(df, use_container_width=True, hide_index=True)
 
 # -------------------- CHANGE LOG TAB --------------------
 with tabs[1]:
