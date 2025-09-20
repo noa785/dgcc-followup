@@ -11,8 +11,7 @@ import shutil
 from db_core import init_db, get_conn, get_db_path
 
 st.set_page_config(page_title="Follow-up Manager (DB Mode)", layout="wide")
-st.title("📋 Follow-up Manager — Database Mode (No Excel)")
-
+st.title("Follow-up Manager")
 # ---------- Helpers ----------
 CANON_STATUS = {
     "done": "Done",
