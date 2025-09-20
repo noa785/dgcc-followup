@@ -1,21 +1,17 @@
-# app.py
+# app.py  — SQLite version (no Supabase)
 import io
 import pandas as pd
 import streamlit as st
 import datetime as dt
 from dateutil import tz
-from supabase import create_client
+
 from db_core import (
     init_db, insert_deliverable, insert_task, fetch_deliverables,
     fetch_tasks_flat, delete_deliverable, insert_archive, fetch_archives
 )
 
 # ----------------------- Config -----------------------
-TZ = st.secrets.get("app", {}).get("timezone", "Asia/Riyadh")
-SUPA_URL = st.secrets["supabase"]["url"]
-SUPA_KEY = st.secrets["supabase"]["anon_key"]
-SUPA_BUCKET = st.secrets["supabase"]["bucket"]
-supabase = create_client(SUPA_URL, SUPA_KEY)
+TZ = "Asia/Riyadh"
 
 st.set_page_config(page_title="Follow-up Manager", page_icon="🗂️", layout="wide")
 st.title("Follow-up Manager")
@@ -25,11 +21,6 @@ init_db()
 
 # ----------------------- Helpers ---------------------
 STATUSES = ["Not started", "In progress", "Blocked", "Done"]
-
-def upload_to_storage(data: bytes, path: str, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") -> str:
-    # upsert=true to overwrite same path
-    supabase.storage.from_(SUPA_BUCKET).upload(path, data, {"upsert": "true", "contentType": content_type})
-    return supabase.storage.from_(SUPA_BUCKET).get_public_url(path)
 
 def export_all_to_excel() -> bytes:
     """One Excel with two sheets: Deliverables & Tasks (flat)."""
@@ -47,9 +38,8 @@ def export_all_to_excel() -> bytes:
     buf.seek(0)
     return buf.read()
 
-def archive_selection(ids:list[int], title:str) -> str:
-    """Create an Excel containing chosen deliverables + tasks and upload to Storage."""
-    # Build data
+def archive_selection(ids:list[int], title:str) -> bytes:
+    """Create an Excel containing chosen deliverables + tasks; store bytes (SQLite archive row keeps metadata)."""
     all_d = fetch_deliverables()
     selected = [d for d in all_d if d["id"] in ids]
     rows_d = [{
@@ -69,25 +59,20 @@ def archive_selection(ids:list[int], title:str) -> str:
                 "owner": t["owner"],
                 "due_date": t["due_date"],
             })
-    # Excel
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xl:
         pd.DataFrame(rows_d).to_excel(xl, index=False, sheet_name="Deliverables")
         pd.DataFrame(rows_t).to_excel(xl, index=False, sheet_name="Tasks")
     buf.seek(0)
-    # Upload
-    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = f"archives/{title}_{ts}.xlsx"
-    url = upload_to_storage(buf.getvalue(), path)
-    # Record archive row
-    insert_archive(title=title, file_url=url, items_count=len(selected))
-    return url
+    # record archive metadata in DB (no file upload in SQLite mode)
+    insert_archive(title=title, file_url=None, items_count=len(selected))
+    return buf.getvalue()
 
 # ----------------------- Sidebar ----------------------
 with st.sidebar:
     st.header("⚙️ Options")
-    due_soon_days = st.number_input("Due soon window (days)", 1, 30, 3)
-    st.caption("All data is saved in Postgres. Excel backups go to Supabase Storage.")
+    st.session_state["due_soon_days"] = st.number_input("Due soon window (days)", 1, 30, 3)
+    st.caption("All data is saved locally in SQLite. Use the download buttons for backups.")
 
 # ----------------------- Add Deliverable & Tasks ----------------------
 st.subheader("Add Deliverable & Tasks")
@@ -103,13 +88,13 @@ with st.form("deliverable_form", clear_on_submit=True):
 
     st.markdown("**Tasks (add 1–5; leave blank rows empty):**")
     rows = []
-    for i in range(1, 6):
-        t1, t2, t3 = st.columns([2, 1, 1])
+    for i in range(1, 5+1):
+        t1, t2, t3, t4 = st.columns([2, 1, 1, 1.2])
         title = t1.text_input(f"Task {i} title", key=f"title{i}", placeholder="e.g., Collect inputs")
         status = t2.selectbox(f"Status {i}", STATUSES, index=0, key=f"status{i}")
         due = t3.date_input(f"Due {i}", value=None, key=f"due{i}", format="YYYY-MM-DD")
-        o1 = st.text_input(f"Owner {i} (optional)", key=f"owner{i}")
-        rows.append({"title": title, "status": status, "owner": o1, "due": due})
+        owner = t4.text_input(f"Owner {i} (optional)", key=f"owner{i}")
+        rows.append({"title": title, "status": status, "owner": owner, "due": due})
 
     submit = st.form_submit_button("➕ Save deliverable & tasks")
     if submit:
@@ -140,7 +125,6 @@ with st.form("deliverable_form", clear_on_submit=True):
 st.subheader("Deliverables")
 dels = fetch_deliverables()
 
-# Quick grid: 3 per row (cards)
 if not dels:
     st.info("No deliverables yet.")
 else:
@@ -149,15 +133,17 @@ else:
         selectable = {f"#{d['id']} — {d['unit']} / {d['name']}": d["id"] for d in dels}
         selected = st.multiselect("Choose deliverables (any number)", list(selectable.keys()))
         title = st.text_input("Archive title", value="Batch")
-        if st.button("Create archive"):
+        make = st.button("Create archive")
+        if make:
             if not selected:
                 st.warning("Pick at least one deliverable.")
             else:
                 ids = [selectable[k] for k in selected]
-                url = archive_selection(ids, title)
-                st.success(f"Archive created → {url}")
+                data = archive_selection(ids, title)
+                st.download_button("⬇️ Download archive .xlsx", data, file_name=f"{title}.xlsx")
+                st.success("Archive saved in DB (metadata) and ready to download.")
 
-    # Cards
+    # Cards (3 per row)
     cols = st.columns(3)
     for i, d in enumerate(dels):
         with cols[i % 3]:
@@ -179,28 +165,29 @@ else:
     if df_tasks.empty:
         st.caption("No tasks yet.")
     else:
-        # Small computed flags
         tzinfo = tz.gettz(TZ)
         today = dt.datetime.now(tzinfo).date()
-        def due_status(row):
+        def due_flag(row):
             d = row.get("due_date")
-            if not d: return ""
-            d = pd.to_datetime(d).date()
-            if (row.get("status") or "").lower() == "done": return "Done"
-            if d < today: return "Overdue"
-            if 0 <= (d - today).days <= st.session_state.get("due_soon_days", 3): return "Due soon"
+            if not d:
+                return ""
+            d = pd.to_datetime(d, errors="coerce")
+            if pd.isna(d):
+                return ""
+            d = d.date()
+            if (row.get("status") or "").lower() == "done":
+                return "Done"
+            if d < today:
+                return "Overdue"
+            if 0 <= (d - today).days <= st.session_state.get("due_soon_days", 3):
+                return "Due soon"
             return ""
-        df_tasks["DueFlag"] = df_tasks.apply(due_status, axis=1)
+        df_tasks["DueFlag"] = df_tasks.apply(due_flag, axis=1)
         st.dataframe(df_tasks, use_container_width=True, hide_index=True)
 
     st.markdown("---")
-    # Backup/export buttons
     exp = export_all_to_excel()
     st.download_button("⬇️ Download full Excel snapshot", exp, file_name="FollowUp_Full.xlsx")
-    if st.button("☁️ Save full backup to cloud"):
-        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        url = upload_to_storage(exp, f"backups/FollowUp_Backup_{ts}.xlsx")
-        st.success(f"Backup saved → {url}")
 
 # ----------------------- Archives List ----------------------
 st.subheader("Archives")
