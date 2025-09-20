@@ -1,243 +1,226 @@
-# app_db.py  — Follow-up Manager (SQLite, no Supabase)
-
-import io
+# db_core.py
+import sqlite3
 import datetime as dt
-from typing import List, Optional
+from pathlib import Path
+import json
 
-import pandas as pd
-import streamlit as st
-from dateutil import tz
-
-# ---- use module import to avoid "cannot import name ..." errors
-import db_core as dbc
+DB_PATH = Path("followup.db")
 
 
-# ----------------------- Config -----------------------
-TZ = "Asia/Riyadh"
-STATUSES = ["Not started", "In progress", "Blocked", "Done"]
-
-st.set_page_config(page_title="Follow-up Manager", page_icon="🗂️", layout="wide")
-st.title("Follow-up Manager")
-
-# ----------------------- Init DB ----------------------
-dbc.init_db()
+# ---------------- Core ----------------
+def _connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-# ----------------------- Helpers ---------------------
-def to_date_str(value) -> Optional[str]:
-    """Return 'YYYY-MM-DD' or None for any date-like value (or None)."""
-    if value is None or value == "" or str(value).strip().lower() == "none":
-        return None
-    try:
-        d = pd.to_datetime(value, errors="coerce")
-        if pd.isna(d):
-            return None
-        if hasattr(d, "date"):
-            d = d.date()
-        return d.isoformat()
-    except Exception:
-        return None
+def init_db():
+    """Create base tables and run additive migrations (safe on existing DB)."""
+    conn = _connect()
+    cur = conn.cursor()
+
+    # Base tables (first-time)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS deliverables(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        unit TEXT,
+        name TEXT NOT NULL,
+        owner TEXT,
+        owner_email TEXT,
+        notes TEXT,
+        due_date TEXT,
+        status TEXT
+    );
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS tasks(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        deliverable_id INTEGER,
+        task TEXT NOT NULL,
+        owner TEXT,
+        notes TEXT,
+        due_date TEXT,
+        status TEXT,
+        FOREIGN KEY(deliverable_id) REFERENCES deliverables(id) ON DELETE CASCADE
+    );
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS archives(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope TEXT NOT NULL,            -- 'deliverable' or 'task'
+        payload_json TEXT NOT NULL,
+        archived_at TEXT NOT NULL
+    );
+    """)
+
+    conn.commit()
+
+    # Additive migrations
+    def _ensure_cols(table, cols):
+        cur.execute(f"PRAGMA table_info({table});")
+        have = {r["name"] for r in cur.fetchall()}
+        for col, typ in cols:
+            if col not in have:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ};")
+
+    # Newer deliverable fields
+    _ensure_cols("deliverables", [
+        ("priority", "TEXT"),         # Low/Medium/High/Critical
+        ("category", "TEXT"),
+        ("tags", "TEXT"),
+        ("expected_hours", "REAL"),
+        ("start_date", "TEXT"),
+        ("last_update", "TEXT")
+    ])
+
+    # Newer task fields
+    _ensure_cols("tasks", [
+        ("priority", "TEXT"),
+        ("tags", "TEXT"),
+        ("expected_hours", "REAL"),
+        ("start_date", "TEXT"),
+        ("last_update", "TEXT"),
+        ("blocked_reason", "TEXT")
+    ])
+
+    conn.commit()
+    conn.close()
 
 
-def export_all_to_excel() -> bytes:
-    """One Excel with two sheets: Deliverables & Tasks (flat)."""
-    dels = dbc.fetch_deliverables()
-    tasks = dbc.fetch_tasks_flat()
-
-    df_dels = pd.DataFrame([{
-        "id": d["id"], "unit": d["unit"], "deliverable": d["name"],
-        "owner": d["owner"], "notes": d["notes"],
-        "due_date": d["due_date"], "created_at": d["created_at"]
-    } for d in (dels or [])])
-
-    df_tasks = pd.DataFrame(tasks or [])
-
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
-        (df_dels if not df_dels.empty else pd.DataFrame()).to_excel(
-            xl, index=False, sheet_name="Deliverables")
-        (df_tasks if not df_tasks.empty else pd.DataFrame()).to_excel(
-            xl, index=False, sheet_name="Tasks")
-    buf.seek(0)
-    return buf.read()
-
-
-def archive_selection(ids: List[int], title: str) -> bytes:
-    """
-    Create an Excel containing chosen deliverables + tasks and
-    store metadata in the archives table (no cloud upload).
-    """
-    all_d = dbc.fetch_deliverables()
-    chosen = [d for d in (all_d or []) if d["id"] in ids]
-
-    rows_d = [{
-        "id": d["id"], "unit": d["unit"], "deliverable": d["name"],
-        "owner": d["owner"], "notes": d["notes"],
-        "due_date": d["due_date"], "created_at": d["created_at"]
-    } for d in chosen]
-
-    rows_t = []
-    for d in chosen:
-        for t in (d.get("tasks") or []):
-            rows_t.append({
-                "deliverable_id": d["id"],
-                "deliverable": d["name"],
-                "unit": d["unit"],
-                "task_id": t["id"],
-                "title": t["title"],
-                "status": t["status"],
-                "owner": t["owner"],
-                "due_date": t["due_date"],
-            })
-
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
-        pd.DataFrame(rows_d).to_excel(xl, index=False, sheet_name="Deliverables")
-        pd.DataFrame(rows_t).to_excel(xl, index=False, sheet_name="Tasks")
-    buf.seek(0)
-
-    # record archive metadata (file_url None in SQLite mode)
-    dbc.insert_archive(title=title, file_url=None, items_count=len(chosen))
-    return buf.getvalue()
+# ---------------- Inserts/Updates ----------------
+def insert_deliverable(
+    unit, name, owner, owner_email, notes, due_date, status,
+    priority=None, category=None, tags=None, expected_hours=None,
+    start_date=None
+):
+    conn = _connect()
+    cur = conn.cursor()
+    now = dt.datetime.utcnow().isoformat()
+    cur.execute("""
+        INSERT INTO deliverables(
+            unit, name, owner, owner_email, notes, due_date, status,
+            priority, category, tags, expected_hours, start_date, last_update
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        unit, name, owner, owner_email, notes, due_date, status,
+        priority, category, tags, expected_hours, start_date, now
+    ))
+    conn.commit()
+    did = cur.lastrowid
+    conn.close()
+    return did
 
 
-# ----------------------- Sidebar ----------------------
-with st.sidebar:
-    st.header("⚙️ Options")
-    st.session_state["due_soon_days"] = st.number_input(
-        "Due soon window (days)", 1, 30, 3)
-    st.caption("All data is saved locally in SQLite. Use the download buttons for backups.")
+def insert_task(
+    deliverable_id, task, owner, notes, due_date, status,
+    priority=None, tags=None, expected_hours=None,
+    start_date=None, blocked_reason=None
+):
+    conn = _connect()
+    cur = conn.cursor()
+    now = dt.datetime.utcnow().isoformat()
+    cur.execute("""
+        INSERT INTO tasks(
+            deliverable_id, task, owner, notes, due_date, status,
+            priority, tags, expected_hours, start_date, last_update, blocked_reason
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        deliverable_id, task, owner, notes, due_date, status,
+        priority, tags, expected_hours, start_date, now, blocked_reason
+    ))
+    conn.commit()
+    conn.close()
 
 
-# ----------------------- Add Deliverable & Tasks ----------------------
-st.subheader("Add Deliverable & Tasks")
-
-with st.form("deliverable_form", clear_on_submit=True):
-    c1, c2, c3 = st.columns([1, 2, 1])
-    unit = c1.text_input("Unit*", placeholder="e.g., ODU")
-    deliverable = c2.text_input("Deliverable / Project*", placeholder="e.g., Monthly Dashboard")
-
-    # date_input: to keep it optional across Streamlit versions, we let the user
-    # check "No due date". Otherwise we save the selected date.
-    use_due = c3.checkbox("Set due date?", value=False, help="Leave unchecked if no due date")
-    due_date_raw = c3.date_input("Deliverable Due", value=dt.date.today(), format="YYYY-MM-DD") if use_due else None
-
-    c4, c5 = st.columns([1, 2])
-    d_owner = c4.text_input("Deliverable Owner (optional)")
-    d_notes = c5.text_input("Notes (optional)")
-
-    st.markdown("**Tasks (add 1–5; leave blank rows empty):**")
-    rows = []
-    for i in range(1, 6):
-        t1, t2, t3, t4 = st.columns([2, 1, 1.2, 1.2])
-        title = t1.text_input(f"Task {i} title", key=f"title{i}", placeholder="e.g., Collect inputs")
-        status = t2.selectbox(f"Status {i}", STATUSES, index=0, key=f"status{i}")
-        use_task_due = t3.checkbox(f"Due {i}?", key=f"use_due{i}", value=False)
-        task_due_raw = t3.date_input(f"Date {i}", value=dt.date.today(), key=f"due{i}", format="YYYY-MM-DD") if use_task_due else None
-        owner = t4.text_input(f"Owner {i} (optional)", key=f"owner{i}")
-        rows.append({"title": title, "status": status, "owner": owner, "due": task_due_raw})
-
-    submit = st.form_submit_button("➕ Save deliverable & tasks")
-    if submit:
-        if not unit.strip() or not deliverable.strip():
-            st.error("Unit and Deliverable are required.")
-        else:
-            did = dbc.insert_deliverable(
-                unit=unit.strip(),
-                name=deliverable.strip(),
-                owner=(d_owner or None),
-                notes=(d_notes or None),
-                due_date=to_date_str(due_date_raw),
-            )
-            count = 0
-            for r in rows:
-                if r["title"].strip():
-                    dbc.insert_task(
-                        deliverable_id=did,
-                        title=r["title"].strip(),
-                        status=r["status"],
-                        owner=(r["owner"] or None),
-                        due_date=to_date_str(r["due"]),
-                    )
-                    count += 1
-            st.success(f"Saved ✅  Deliverable '{deliverable}' with {count} task(s).")
+def touch_deliverable_last_update(deliverable_id):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE deliverables SET last_update=? WHERE id=?",
+                (dt.datetime.utcnow().isoformat(), deliverable_id))
+    conn.commit()
+    conn.close()
 
 
-# ----------------------- List & Manage ----------------------
-st.subheader("Deliverables")
-dels = dbc.fetch_deliverables()
+def delete_deliverable(deliverable_id):
+    """Archive then delete deliverable + its tasks."""
+    conn = _connect()
+    cur = conn.cursor()
 
-if not dels:
-    st.info("No deliverables yet.")
-else:
-    # Archive builder
-    with st.expander("📦 Create an archive from selected deliverables"):
-        selectable = {f"#{d['id']} — {d['unit']} / {d['name']}": d["id"] for d in dels}
-        selected_labels = st.multiselect("Choose deliverables (any number)", list(selectable.keys()))
-        title = st.text_input("Archive title", value="Batch")
-        if st.button("Create archive"):
-            if not selected_labels:
-                st.warning("Pick at least one deliverable.")
-            else:
-                ids = [selectable[k] for k in selected_labels]
-                data = archive_selection(ids, title)
-                st.download_button("⬇️ Download archive .xlsx", data, file_name=f"{title}.xlsx")
-                st.success("Archive recorded (metadata) and ready to download.")
+    cur.execute("SELECT * FROM deliverables WHERE id=?", (deliverable_id,))
+    d = cur.fetchone()
+    if d:
+        archive_payload = dict(d)
+        cur.execute("SELECT * FROM tasks WHERE deliverable_id=?", (deliverable_id,))
+        trows = [dict(r) for r in cur.fetchall()]
+        archive_payload["_tasks"] = trows
+        cur.execute("""
+            INSERT INTO archives(scope, payload_json, archived_at)
+            VALUES (?,?,?)
+        """, ("deliverable", json.dumps(archive_payload), dt.datetime.utcnow().isoformat()))
 
-    # Cards (3 per row)
-    cols = st.columns(3)
-    for i, d in enumerate(dels):
-        with cols[i % 3]:
-            st.markdown(
-                f"""
-                <div style="padding:14px;border:1px solid #e5e7eb;border-radius:14px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.05);margin-bottom:14px;">
-                  <div style="font-size:18px;font-weight:700;margin-bottom:4px;">{d['unit']} — {d['name']}</div>
-                  <div style="color:#6b7280;font-size:13px;margin-bottom:6px;">Owner: {d.get('owner') or '—'} | Due: {d.get('due_date') or '—'}</div>
-                  <div style="color:#374151;font-size:14px;">{d.get('notes') or ''}</div>
-                  <div style="margin-top:10px;color:#6b7280;font-size:13px;">Tasks: {len(d.get('tasks') or [])}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-    st.markdown("### All tasks (flat)")
-    tasks = dbc.fetch_tasks_flat()
-    df_tasks = pd.DataFrame(tasks or [])
-    if df_tasks.empty:
-        st.caption("No tasks yet.")
-    else:
-        tzinfo = tz.gettz(TZ)
-        today = dt.datetime.now(tzinfo).date()
-
-        def due_flag(row):
-            d = to_date_str(row.get("due_date"))
-            if not d:
-                return ""
-            d = pd.to_datetime(d, errors="coerce")
-            if pd.isna(d):
-                return ""
-            d = d.date()
-            status = (row.get("status") or "").strip().lower()
-            if status == "done":
-                return "Done"
-            if d < today:
-                return "Overdue"
-            if 0 <= (d - today).days <= st.session_state.get("due_soon_days", 3):
-                return "Due soon"
-            return ""
-
-        df_tasks["DueFlag"] = df_tasks.apply(due_flag, axis=1)
-        st.dataframe(df_tasks, use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-    exp = export_all_to_excel()
-    st.download_button("⬇️ Download full Excel snapshot", exp, file_name="FollowUp_Full.xlsx")
+    cur.execute("DELETE FROM tasks WHERE deliverable_id=?", (deliverable_id,))
+    cur.execute("DELETE FROM deliverables WHERE id=?", (deliverable_id,))
+    conn.commit()
+    conn.close()
 
 
-# ----------------------- Archives List ----------------------
-st.subheader("Archives")
-arch = dbc.fetch_archives()
-if not arch:
-    st.caption("No archives yet.")
-else:
-    st.dataframe(pd.DataFrame(arch), use_container_width=True, hide_index=True)
+# ---------------- Fetches ----------------
+def fetch_deliverables():
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, unit, name, owner, owner_email, notes, due_date, status,
+               priority, category, tags, expected_hours, start_date, last_update
+        FROM deliverables
+        ORDER BY COALESCE(due_date,'9999-12-31') ASC, priority DESC, id ASC;
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def fetch_tasks_for(deliverable_id):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, deliverable_id, task, owner, notes, due_date, status,
+               priority, tags, expected_hours, start_date, last_update, blocked_reason
+        FROM tasks
+        WHERE deliverable_id=?
+        ORDER BY COALESCE(due_date,'9999-12-31') ASC, priority DESC, id ASC;
+    """, (deliverable_id,))
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def fetch_tasks_flat():
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT t.id, t.deliverable_id, d.name AS deliverable_name,
+               t.task, t.owner, t.notes, t.due_date, t.status,
+               t.priority, t.tags, t.expected_hours, t.start_date, t.last_update, t.blocked_reason
+        FROM tasks t
+        LEFT JOIN deliverables d ON d.id = t.deliverable_id
+        ORDER BY COALESCE(t.due_date,'9999-12-31') ASC, t.priority DESC, t.id ASC;
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def fetch_archives(limit=200):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, scope, payload_json, archived_at
+        FROM archives
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,))
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
